@@ -1,0 +1,16 @@
+name: Trigger Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger lookout-mirror build and deploy
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.MIRROR_DISPATCH_TOKEN }}
+          repository: lordbagel42/lookout-mirror
+          event-type: source-updated
