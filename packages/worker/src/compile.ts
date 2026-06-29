@@ -164,7 +164,7 @@ export async function compileTimelapse(sessionId: string): Promise<{
     }>(sql`
       SELECT DISTINCT ON (minute_bucket) id, r2_key, minute_bucket, requested_at
       FROM screenshots
-      WHERE session_id = ${sessionId} AND confirmed = true
+      WHERE session_id = ${sessionId} AND confirmed = true AND excluded = false
       ORDER BY minute_bucket,
         ABS(EXTRACT(EPOCH FROM (requested_at - (
           ${session.startedAt!}::timestamptz

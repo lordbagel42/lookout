@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { eq, sql, and, isNotNull } from "drizzle-orm";
+import { eq, sql, and, isNotNull, asc, count } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { requireApiKey } from "../middleware/apiKey.js";
 import { boss, COMPILE_JOB } from "../lib/queue.js";
@@ -255,7 +255,9 @@ export async function internalRoutes(app: FastifyInstance) {
     },
   );
 
-  // Re-trigger compilation for failed sessions
+  // Re-trigger compilation for failed or complete sessions.
+  // When triggered after screenshot exclusions, resets sampled flags so the
+  // worker re-derives which frames to include.
   app.post<{
     Params: { sessionId: string };
   }>(
@@ -274,16 +276,56 @@ export async function internalRoutes(app: FastifyInstance) {
         return reply.code(404).send({ error: "Session not found" });
       }
 
-      if (session.status !== "failed") {
+      if (session.status !== "failed" && session.status !== "complete") {
         return reply
           .code(409)
-          .send({ error: "Only failed sessions can be recompiled" });
+          .send({ error: "Session cannot be recompiled in its current status" });
       }
+
+      if (session.screenshotsPurgedAt !== null) {
+        return reply
+          .code(409)
+          .send({ error: "Screenshots have been purged and can no longer be edited" });
+      }
+
+      // Ensure at least one non-excluded confirmed screenshot remains
+      const [{ remaining }] = await db
+        .select({ remaining: count() })
+        .from(schema.screenshots)
+        .where(
+          and(
+            eq(schema.screenshots.sessionId, sessionId),
+            eq(schema.screenshots.confirmed, true),
+            eq(schema.screenshots.excluded, false),
+          ),
+        );
+
+      if (Number(remaining) === 0) {
+        return reply
+          .code(422)
+          .send({ error: "No screenshots remain after exclusions" });
+      }
+
+      // Reset sampled flags so the worker re-derives the frame selection
+      await db
+        .update(schema.screenshots)
+        .set({ sampled: false })
+        .where(
+          and(
+            eq(schema.screenshots.sessionId, sessionId),
+            eq(schema.screenshots.confirmed, true),
+          ),
+        );
 
       const [updated] = await db
         .update(schema.sessions)
-        .set({ status: "compiling", updatedAt: new Date() })
-        .where(and(eq(schema.sessions.id, sessionId), eq(schema.sessions.status, "failed")))
+        .set({ status: "stopped", updatedAt: new Date() })
+        .where(
+          and(
+            eq(schema.sessions.id, sessionId),
+            sql`${schema.sessions.status} IN ('failed', 'complete')`,
+          ),
+        )
         .returning({ id: schema.sessions.id });
 
       if (!updated) {
@@ -292,7 +334,113 @@ export async function internalRoutes(app: FastifyInstance) {
 
       await boss.send(COMPILE_JOB, { sessionId });
 
-      return { status: "compiling" };
+      return reply.code(202).send({ status: "compiling" });
+    },
+  );
+
+  // List all confirmed screenshots for a session with preview URLs.
+  // Used by integrating programs to render a filmstrip for editing.
+  app.get<{
+    Params: { sessionId: string };
+  }>(
+    "/api/internal/sessions/:sessionId/screenshots",
+    {
+      schema: { params: sessionIdParamSchema },
+    },
+    async (request, reply) => {
+      const { sessionId } = request.params;
+
+      const session = await db.query.sessions.findFirst({
+        where: eq(schema.sessions.id, sessionId),
+      });
+
+      if (!session) {
+        return reply.code(404).send({ error: "Session not found" });
+      }
+
+      const baseUrl = process.env.BASE_URL || "http://localhost:3000";
+
+      const screenshots = await db
+        .select({
+          id: schema.screenshots.id,
+          minuteBucket: schema.screenshots.minuteBucket,
+          capturedAt: schema.screenshots.capturedAt,
+          excluded: schema.screenshots.excluded,
+        })
+        .from(schema.screenshots)
+        .where(
+          and(
+            eq(schema.screenshots.sessionId, sessionId),
+            eq(schema.screenshots.confirmed, true),
+          ),
+        )
+        .orderBy(
+          asc(schema.screenshots.minuteBucket),
+          asc(schema.screenshots.capturedAt),
+        );
+
+      return {
+        screenshots: screenshots.map((s) => ({
+          ...s,
+          previewUrl: `${baseUrl}/api/media/${sessionId}/screenshots/${s.id}.jpg`,
+        })),
+        canEdit: session.screenshotsPurgedAt === null,
+      };
+    },
+  );
+
+  // Soft-delete a screenshot by marking it excluded.
+  // Idempotent — excluding an already-excluded screenshot returns 200.
+  app.delete<{
+    Params: { sessionId: string; screenshotId: string };
+  }>(
+    "/api/internal/sessions/:sessionId/screenshots/:screenshotId",
+    {
+      schema: {
+        params: {
+          type: "object" as const,
+          properties: {
+            sessionId: { type: "string" as const, format: "uuid" },
+            screenshotId: { type: "string" as const, format: "uuid" },
+          },
+          required: ["sessionId", "screenshotId"] as const,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { sessionId, screenshotId } = request.params;
+
+      const session = await db.query.sessions.findFirst({
+        where: eq(schema.sessions.id, sessionId),
+      });
+
+      if (!session) {
+        return reply.code(404).send({ error: "Session not found" });
+      }
+
+      if (session.screenshotsPurgedAt !== null) {
+        return reply
+          .code(409)
+          .send({ error: "Screenshots have been purged and can no longer be edited" });
+      }
+
+      const screenshot = await db.query.screenshots.findFirst({
+        where: and(
+          eq(schema.screenshots.id, screenshotId),
+          eq(schema.screenshots.sessionId, sessionId),
+        ),
+      });
+
+      if (!screenshot) {
+        return reply.code(404).send({ error: "Screenshot not found" });
+      }
+
+      await db
+        .update(schema.screenshots)
+        .set({ excluded: true })
+        .where(eq(schema.screenshots.id, screenshotId));
+
+      return { excluded: true };
     },
   );
 }
