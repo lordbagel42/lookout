@@ -154,6 +154,7 @@ export const screenshots = pgTable(
     height: integer("height"),
     fileSizeBytes: integer("file_size_bytes"),
     sampled: boolean("sampled").notNull().default(false),
+    excluded: boolean("excluded").notNull().default(false),
     // Client-attested (or server-fallback) capture time. Populated for ALL
     // new rows post-migration 0007 regardless of mode — credit-mode rows use
     // it for streak math, bucket-mode rows store it as debug-only data.

@@ -1,0 +1,1 @@
+ALTER TABLE "screenshots" ADD COLUMN "excluded" boolean DEFAULT false NOT NULL;

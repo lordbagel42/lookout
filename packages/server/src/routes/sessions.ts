@@ -1292,6 +1292,57 @@ export async function sessionRoutes(app: FastifyInstance) {
     },
   );
 
+  app.get<{ Params: { sessionId: string; screenshotId: string } }>(
+    "/api/media/:sessionId/screenshots/:screenshotId.jpg",
+    {
+      schema: {
+        params: {
+          type: "object" as const,
+          properties: {
+            sessionId: { type: "string" as const, format: "uuid" },
+            screenshotId: { type: "string" as const, format: "uuid" },
+          },
+          required: ["sessionId", "screenshotId"] as const,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { sessionId, screenshotId } = request.params;
+
+      const rl = checkGenericRateLimit("media-screenshot", screenshotId, 30);
+      if (!rl.allowed) {
+        reply.header("Retry-After", String(Math.ceil((rl.retryAfterMs ?? 60_000) / 1000)));
+        return reply.code(429).send({ error: "Rate limit exceeded" });
+      }
+
+      const session = await db.query.sessions.findFirst({
+        where: eq(schema.sessions.id, sessionId),
+      });
+      if (!session || session.screenshotsPurgedAt !== null) {
+        return reply.code(404).send({ error: "Screenshots not available" });
+      }
+
+      const screenshot = await db.query.screenshots.findFirst({
+        where: and(
+          eq(schema.screenshots.id, screenshotId),
+          eq(schema.screenshots.sessionId, sessionId),
+        ),
+      });
+      if (!screenshot) {
+        return reply.code(404).send({ error: "Screenshot not found" });
+      }
+
+      const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+      const url = await getSignedUrl(r2Client, new GetObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: screenshot.r2Key,
+      }), { expiresIn: 3600 });
+
+      reply.header("Cache-Control", "public, max-age=1800");
+      return reply.redirect(url);
+    },
+  );
+
   // Legacy: pre-MP4-only clients still hit this. Always redirect to the
   // static "please update" WebM so they show the upgrade prompt instead of
   // a broken player.
